@@ -31,7 +31,7 @@
     "testcontainers": "^11.7.0",
     "ts-node": "^10.9.2",
     "tsx": "^4.20.6",
-    "typescript": "^5.9.2",
+    "typescript": "^5.9.3",
     "vitest": "^3.2.4"
   },
   "homepage": "https://github.com/ChrisChung/ssh-mcp-keepalive#readme",
