@@ -1,11 +1,11 @@
 {
-  "name": "ssh-mcp",
+  "name": "ssh-mcp-keepalive",
   "license": "MIT",
-  "version": "1.5.0",
+  "version": "1.0.0",
   "description": "MCP server exposing SSH control for Linux and Windows systems via Model Context Protocol.",
   "type": "module",
   "bin": {
-    "ssh-mcp": "build/index.js"
+    "ssh-mcp-keepalive": "build/index.js"
   },
   "scripts": {
     "prepare": "npm run build",
@@ -34,13 +34,13 @@
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"
   },
-  "homepage": "https://github.com/tufantunc/ssh-mcp#readme",
+  "homepage": "https://github.com/ChrisChung/ssh-mcp-keepalive#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/tufantunc/ssh-mcp.git"
+    "url": "https://github.com/ChrisChung/ssh-mcp-keepalive.git"
   },
   "bugs": {
-    "url": "https://github.com/tufantunc/ssh-mcp/issues"
+    "url": "https://github.com/ChrisChung/ssh-mcp-keepalive/issues"
   },
   "keywords": [
     "ssh",
@@ -54,7 +54,7 @@
     "cli",
     "typescript"
   ],
-  "author": "tufantunc",
+  "author": "ChrisChung",
   "engines": {
     "node": ">=18"
   }

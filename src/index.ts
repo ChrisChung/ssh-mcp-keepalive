@@ -5,6 +5,28 @@ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { Client, ClientChannel } from 'ssh2';
 import { z } from 'zod';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { appendFileSync, mkdirSync } from 'fs';
+import { join } from 'path';
+
+const LOG_DIR = 'D:/logs';
+const LOG_FILE = join(LOG_DIR, 'ssh-mcp.log');
+const ENABLE_LOG = false;  // Set to true to enable file logging
+
+function writeLog(level: string, message: string): void {
+  if (!ENABLE_LOG) return;
+  const timestamp = new Date().toISOString();
+  const line = `[${timestamp}] [${level}] ${message}\n`;
+  try { mkdirSync(LOG_DIR, { recursive: true }); } catch { /* ignore */ }
+  try { appendFileSync(LOG_FILE, line); } catch { /* ignore write failures */ }
+}
+
+const log = {
+  info: (msg: string) => writeLog('INFO', msg),
+  warn: (msg: string) => writeLog('WARN', msg),
+  error: (msg: string) => writeLog('ERROR', msg),
+};
+
+log.info('========== SSH MCP Server session started ==========');
 
 // Example usage: node build/index.js --host=1.2.3.4 --port=22 --user=root --password=pass --key=path/to/key --timeout=5000 --disableSudo
 function parseArgv() {
@@ -124,6 +146,10 @@ export class SSHConnectionManager {
   private suShell: any = null;  // Store the elevated shell session
   private suPromise: Promise<void> | null = null;
   private isElevated = false;  // Track if we're in su mode
+  private connected = false;  // Track connection state via events
+  private reconnectAttempts = 0;
+  private maxReconnectAttempts = 5;
+  private reconnectTimer: NodeJS.Timeout | null = null;
 
   constructor(config: SSHConfig) {
     this.sshConfig = config;
@@ -138,6 +164,15 @@ export class SSHConnectionManager {
       return this.connectionPromise; // Wait for ongoing connection
     }
 
+    // Clear any pending reconnect timer
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    const connectStart = Date.now();
+    log.info(`Connecting to ${this.sshConfig.host}:${this.sshConfig.port}...`);
+
     this.isConnecting = true;
     this.connectionPromise = new Promise((resolve, reject) => {
       this.conn = new Client();
@@ -147,12 +182,18 @@ export class SSHConnectionManager {
         this.conn = null;
         this.isConnecting = false;
         this.connectionPromise = null;
+        this.connected = false;
+        log.error('SSH connection timeout after 30s');
         reject(new McpError(ErrorCode.InternalError, 'SSH connection timeout'));
       }, 30000); // 30 seconds connection timeout
 
       this.conn.on('ready', async () => {
         clearTimeout(timeoutId);
         this.isConnecting = false;
+        this.connected = true;
+        this.reconnectAttempts = 0;
+        const elapsed = Date.now() - connectStart;
+        log.info(`Connected to ${this.sshConfig.host}:${this.sshConfig.port} (${elapsed}ms)`);
 
         // In test mode, don't wait for su elevation during connection setup, as it
         // may cause JSON-RPC server initialization to hang. Instead, elevation will
@@ -162,8 +203,7 @@ export class SSHConnectionManager {
           try {
             await this.ensureElevated();
           } catch (err) {
-            // Do not reject the connection; just log the error. Subsequent commands
-            // will either use the su shell if available or fall back to normal execution.
+            log.warn(`su elevation during connect failed: ${err instanceof Error ? err.message : err}`);
           }
         }
 
@@ -175,31 +215,145 @@ export class SSHConnectionManager {
         this.conn = null;
         this.isConnecting = false;
         this.connectionPromise = null;
+        this.connected = false;
+        log.error(`SSH connection error: ${err.message}`);
         reject(new McpError(ErrorCode.InternalError, `SSH connection error: ${err.message}`));
       });
 
       this.conn.on('end', () => {
         console.error('SSH connection ended');
-        this.conn = null;
-        this.isConnecting = false;
-        this.connectionPromise = null;
+        log.warn('SSH connection ended (end event)');
+        this.connected = false;
+        this.handleDisconnect();
       });
 
       this.conn.on('close', () => {
         console.error('SSH connection closed');
-        this.conn = null;
-        this.isConnecting = false;
-        this.connectionPromise = null;
+        log.warn('SSH connection closed (close event)');
+        this.connected = false;
+        this.handleDisconnect();
       });
 
-      this.conn.connect(this.sshConfig);
+      this.conn.connect({
+        ...this.sshConfig,
+        keepaliveInterval: 15000,   // Send keepalive every 15 seconds
+        keepaliveCountMax: 3,       // Disconnect after 3 consecutive failed keepalives
+      });
     });
 
     return this.connectionPromise;
   }
 
+  private handleDisconnect(): void {
+    this.conn = null;
+    this.isConnecting = false;
+    this.connectionPromise = null;
+    log.warn('SSH connection lost, resetting su state and scheduling reconnect');
+    this.resetSuState();
+    this.scheduleReconnect();
+  }
+
+  private resetSuState(): void {
+    if (this.suShell) {
+      try { this.suShell.end(); } catch (e) { /* ignore */ }
+    }
+    this.suShell = null;
+    this.isElevated = false;
+    this.suPromise = null;
+    log.info('su shell state reset (suShell=null, isElevated=false)');
+  }
+
+  /**
+   * Attempt to recover the su shell after a command timeout.
+   * Sends Ctrl+C to abort any running process and waits for the prompt to
+   * reappear. If the shell does not recover within the timeout, tears it
+   * down completely and re-establishes elevation so the next command can
+   * proceed normally.
+   */
+  async recoverSuShell(): Promise<void> {
+    const shell = this.suShell;
+    if (!shell) return;
+
+    return new Promise<void>((resolve) => {
+      const RECOVERY_TIMEOUT = 5000;
+      let recovered = false;
+
+      const cleanup = (timerHandle: NodeJS.Timeout) => {
+        clearTimeout(timerHandle);
+        try { shell.removeAllListeners('data'); } catch (e) { /* ignore */ }
+      };
+
+      const timer = setTimeout(async () => {
+        if (!recovered) {
+          console.error('su shell recovery timed out — rebuilding elevated session');
+          log.warn('su shell recovery timed out — rebuilding elevated session');
+          cleanup(timer);
+          this.resetSuState();
+          try {
+            await this.ensureConnected();
+            await (this as any).ensureElevated();
+          } catch (e) {
+            console.error('su shell re-elevation failed after recovery timeout:', e);
+            log.error(`su shell re-elevation failed after recovery timeout: ${e instanceof Error ? e.message : e}`);
+          }
+          resolve();
+        }
+      }, RECOVERY_TIMEOUT);
+
+      const onData = (data: Buffer) => {
+        if (/SSH_MCP_READY>/.test(data.toString())) {
+          if (!recovered) {
+            recovered = true;
+            cleanup(timer);
+            console.error('su shell recovered successfully');
+            log.info('su shell recovered successfully after Ctrl+C');
+            resolve();
+          }
+        }
+      };
+
+      shell.on('data', onData);
+      // Send Ctrl+C to interrupt the running process, then a newline so the
+      // shell re-displays its prompt.
+      try {
+        shell.write('\x03');
+        setTimeout(() => {
+          try { shell.write('\n'); } catch (e) { /* ignore */ }
+        }, 100);
+      } catch (e) {
+        cleanup(timer);
+        this.resetSuState();
+        resolve();
+      }
+    });
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      console.error(`SSH reconnect: max attempts (${this.maxReconnectAttempts}) reached, giving up`);
+      log.error(`Reconnect abandoned: max attempts (${this.maxReconnectAttempts}) reached`);
+      return;
+    }
+    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
+    console.error(`SSH reconnect: scheduling attempt ${this.reconnectAttempts + 1}/${this.maxReconnectAttempts} in ${delay}ms`);
+    log.info(`Scheduling reconnect attempt ${this.reconnectAttempts + 1}/${this.maxReconnectAttempts} in ${delay}ms`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectAttempts++;
+      this.connect()
+        .then(() => {
+          console.error('SSH reconnect: succeeded');
+          log.info('Reconnect succeeded');
+        })
+        .catch((err) => {
+          console.error(`SSH reconnect: attempt ${this.reconnectAttempts} failed:`, err instanceof Error ? err.message : err);
+          log.warn(`Reconnect attempt ${this.reconnectAttempts} failed: ${err instanceof Error ? err.message : err}`);
+          this.scheduleReconnect();
+        });
+    }, delay);
+  }
+
   isConnected(): boolean {
-    return this.conn !== null && (this.conn as any)._sock && !(this.conn as any)._sock.destroyed;
+    return this.conn !== null && this.connected;
   }
 
   getSudoPassword(): string | undefined {
@@ -217,6 +371,7 @@ export class SSHConnectionManager {
         await this.ensureElevated();
       } catch (err) {
         console.error('setSuPassword: failed to elevate to su shell:', err);
+        log.error(`setSuPassword: failed to elevate: ${err instanceof Error ? err.message : err}`);
       }
     } else {
       // If clearing suPassword, drop any existing suShell
@@ -228,11 +383,18 @@ export class SSHConnectionManager {
     }
   }
 
+  setSudoPassword(pwd?: string): void {
+    this.sshConfig.sudoPassword = pwd;
+  }
+
   private async ensureElevated(): Promise<void> {
     if (this.isElevated && this.suShell) return;
     if (!this.sshConfig.suPassword) return;
 
     if (this.suPromise) return this.suPromise;
+    log.info('Starting su elevation...');
+
+    let elevationStream: ClientChannel | null = null;
 
     this.suPromise = new Promise((resolve, reject) => {
       const conn = this.getConnection();
@@ -240,53 +402,84 @@ export class SSHConnectionManager {
       // Add a safety timeout so elevation doesn't hang forever
       const timeoutId = setTimeout(() => {
         this.suPromise = null;
+        // Close leaked stream to free SSH channel
+        if (elevationStream) {
+          log.warn('Closing leaked su shell stream on timeout');
+          try { elevationStream.end(); } catch (e) { /* ignore */ }
+          elevationStream = null;
+        }
+        log.error('su elevation timed out after 15s');
         reject(new McpError(ErrorCode.InternalError, 'su elevation timed out'));
-      }, 10000);  // 10 second timeout for elevation
+      }, 15000);  // 15 second timeout for elevation
 
       conn.shell({ term: 'xterm', cols: 80, rows: 24 }, (err: Error | undefined, stream: ClientChannel) => {
         if (err) {
           clearTimeout(timeoutId);
           this.suPromise = null;
+          log.error(`Failed to start interactive shell for su: ${err.message}`);
+          // Channel failure means the SSH session is broken — force reconnect
+          if (err.message.includes('Channel open failure') || err.message.includes('open failed')) {
+            log.warn('Channel failure detected during su elevation, triggering reconnect');
+            this.forceReconnect();
+          }
           reject(new McpError(ErrorCode.InternalError, `Failed to start interactive shell for su: ${err.message}`));
           return;
         }
 
+        elevationStream = stream;
+        log.info('Interactive shell opened for su elevation');
+
         let buffer = '';
         let passwordSent = false;
+        let ps1Set = false;
         const cleanup = () => {
           try { stream.removeAllListeners('data'); } catch (e) { /* ignore */ }
+          elevationStream = null;
         };
 
         const onData = (data: Buffer) => {
           const text = data.toString();
           buffer += text;
+          log.info(`su shell data (${text.length}b): ${text.slice(0, 60).replace(/\n/g, '\\n').replace(/\r/g, '\\r')}`);
 
           // If we haven't sent the password yet, look for the password prompt
-          if (!passwordSent && /password[: ]/i.test(buffer)) {
+          if (!passwordSent && /(password|密码)[:：\s]/i.test(buffer)) {
             passwordSent = true;
+            log.info('su password prompt detected, sending password');
             stream.write(this.sshConfig.suPassword + '\n');
             // Don't return; keep looking for root prompt
           }
 
           // After password is sent, look for any root indicator
-          // Look for '#' which indicates root prompt (may be followed by spaces, escape codes, etc)
+          // First detect '#' as an intermediate signal that su succeeded,
+          // then set a unique prompt marker for reliable subsequent detection.
           if (passwordSent) {
-            if (/#/.test(buffer)) {
+            if (!ps1Set && /#/.test(buffer)) {
+              ps1Set = true;
+              log.info('Root prompt detected (#), setting unique PS1 marker');
+              // Set a unique prompt that won't appear in normal command output
+              stream.write("export PS1='SSH_MCP_READY> '\n");
+              buffer = '';
+              return;
+            }
+            if (ps1Set && /SSH_MCP_READY>/.test(buffer)) {
               clearTimeout(timeoutId);
               cleanup();
               this.suShell = stream;
               this.isElevated = true;
               this.suPromise = null;
+              log.info('su elevation successful');
               resolve();
               return;
             }
           }
 
           // Detect authentication failure messages
-          if (/authentication failure|incorrect password|su: .*failed|su: failure/i.test(buffer)) {
+          if (/authentication failure|incorrect password|su: .*failed|su: failure|认证失败|密码错误/i.test(buffer)) {
             clearTimeout(timeoutId);
             cleanup();
             this.suPromise = null;
+            log.error(`su authentication failed: ${buffer.trim()}`);
             reject(new McpError(ErrorCode.InternalError, `su authentication failed: ${buffer}`));
             return;
           }
@@ -296,6 +489,7 @@ export class SSHConnectionManager {
 
         stream.on('close', () => {
           clearTimeout(timeoutId);
+          elevationStream = null;
           if (!this.isElevated) {
             this.suPromise = null;
             reject(new McpError(ErrorCode.InternalError, 'su shell closed before elevation completed'));
@@ -310,10 +504,35 @@ export class SSHConnectionManager {
     return this.suPromise;
   }
 
+  forceReconnect(): void {
+    log.warn('Force reconnect triggered — SSH session is broken at channel level');
+    if (this.conn) {
+      try { this.conn.end(); } catch (e) { /* ignore */ }
+    }
+    this.connected = false;
+    this.handleDisconnect();
+  }
+
   async ensureConnected(): Promise<void> {
     if (!this.isConnected()) {
-      await this.connect();
+      await this.connectWithRetry();
     }
+  }
+
+  async connectWithRetry(maxRetries = 3, baseDelay = 1000): Promise<void> {
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        return await this.connect();
+      } catch (err) {
+        if (attempt === maxRetries) throw err;
+        const delay = baseDelay * Math.pow(2, attempt);
+        console.error(`SSH connection attempt ${attempt + 1} failed, retrying in ${delay}ms...`);
+        log.warn(`Connection attempt ${attempt + 1} failed, retrying in ${delay}ms`);
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+    // Unreachable, but TypeScript needs it
+    throw new McpError(ErrorCode.InternalError, 'SSH connection failed after retries');
   }
 
   getConnection(): Client {
@@ -389,7 +608,7 @@ server.tool(
       // If a suPassword was provided, explicitly wait for elevation before executing.
       // This is critical: ensureElevated is idempotent and will return immediately if
       // already elevated, so this ensures we have a su shell before we try to use it.
-      if ((connectionManager as any).getSuPassword && (connectionManager as any).getSuPassword()) {
+      if (connectionManager.getSuPassword()) {
         try {
           const elevationPromise = (connectionManager as any).ensureElevated();
           // Add a short timeout for elevation to complete
@@ -465,8 +684,7 @@ if (!DISABLE_SUDO) {
           await connectionManager.setSuPassword(sanitizePassword(SUPASSWORD));
         }
         if (SUDOPASSWORD !== null && SUDOPASSWORD !== undefined) {
-          // update sudoPassword on the manager instance
-          (connectionManager as any).sshConfig = { ...(connectionManager as any).sshConfig, sudoPassword: sanitizePassword(SUDOPASSWORD) };
+          connectionManager.setSudoPassword(sanitizePassword(SUDOPASSWORD));
         }
 
         let wrapped: string;
@@ -505,10 +723,44 @@ export async function execSshCommandWithConnection(manager: SSHConnectionManager
     const conn = manager.getConnection();
     const shell = (manager as any).suShell;  // Use su shell if available
 
+    // Declared here so the timeout handler can reference it even though it is
+    // only assigned inside the `if (shell)` branch below.
+    let dataHandler: ((data: Buffer) => void) | null = null;
+
+    const cmdStart = Date.now();
+    const cmdPreview = command.length > 80 ? command.slice(0, 80) + '...' : command;
+    log.info(`Executing command via ${shell ? 'su shell' : 'exec'}: ${cmdPreview}`);
+
     // Set up timeout
     timeoutId = setTimeout(() => {
       if (!isResolved) {
         isResolved = true;
+        log.error(`Command timed out after ${DEFAULT_TIMEOUT}ms: ${cmdPreview}`);
+
+        if (shell) {
+          // su shell path: remove the stale listener immediately so it cannot
+          // consume output belonging to the next command, then try to recover
+          // the shell so subsequent commands can run normally.
+          if (dataHandler) shell.removeListener('data', dataHandler);
+          manager.recoverSuShell().catch((e) => {
+            console.error('recoverSuShell error:', e);
+          });
+        } else {
+          // exec path: attempt to kill the timed-out process on the remote side
+          try {
+            conn.exec(
+              `timeout 3s pkill -f '${escapeCommandForShell(command)}' 2>/dev/null || true`,
+              (_err, abortStream) => {
+                if (abortStream) {
+                  abortStream.on('close', () => { /* nothing to do */ });
+                }
+              }
+            );
+          } catch (e) {
+            console.error('pkill exec error during timeout handling:', e);
+          }
+        }
+
         reject(new McpError(ErrorCode.InternalError, `Command execution timed out after ${DEFAULT_TIMEOUT}ms`));
       }
     }, DEFAULT_TIMEOUT);
@@ -517,16 +769,18 @@ export async function execSshCommandWithConnection(manager: SSHConnectionManager
     if (shell) {
       let buffer = '';
 
-      const dataHandler = (data: Buffer) => {
+      dataHandler = (data: Buffer) => {
         const text = data.toString();
         buffer += text;
 
-        // Wait for root prompt (#) to know command is complete
-        // Match # which indicates root prompt (may be followed by spaces, escape codes, etc)
-        if (/#/.test(buffer)) {
+        // Wait for the unique prompt marker to know command is complete
+        // Using SSH_MCP_READY> instead of # to avoid false matches on
+        // comments, hex colors, config files, etc.
+        if (/SSH_MCP_READY>/.test(buffer)) {
           if (!isResolved) {
             isResolved = true;
             clearTimeout(timeoutId);
+            log.info(`Command completed via su shell (${Date.now() - cmdStart}ms): ${cmdPreview}`);
 
             // Extract output: remove the command echo and final prompt
             const lines = buffer.split('\n');
@@ -556,6 +810,12 @@ export async function execSshCommandWithConnection(manager: SSHConnectionManager
         if (!isResolved) {
           isResolved = true;
           clearTimeout(timeoutId);
+          log.error(`SSH exec error: ${err.message}`);
+          // Channel failure means the SSH session is broken — force reconnect
+          if (err.message.includes('Channel open failure') || err.message.includes('open failed')) {
+            log.warn('Channel failure detected during exec, triggering reconnect');
+            manager.forceReconnect();
+          }
           reject(new McpError(ErrorCode.InternalError, `SSH exec error: ${err.message}`));
         }
         return;
@@ -587,8 +847,10 @@ export async function execSshCommandWithConnection(manager: SSHConnectionManager
           isResolved = true;
           clearTimeout(timeoutId);
           if (stderr) {
+            log.error(`Command failed (code ${code}) (${Date.now() - cmdStart}ms): ${cmdPreview} — ${stderr.slice(0, 100)}`);
             reject(new McpError(ErrorCode.InternalError, `Error (code ${code}):\n${stderr}`));
           } else {
+            log.info(`Command completed via exec (code ${code}, ${Date.now() - cmdStart}ms): ${cmdPreview}`);
             resolve({
               content: [{
                 type: 'text',
@@ -597,6 +859,8 @@ export async function execSshCommandWithConnection(manager: SSHConnectionManager
             });
           }
         }
+        // Always clean up stream listeners to prevent resource leaks
+        try { stream.removeAllListeners(); } catch (e) { /* ignore */ }
       });
     });
   });
@@ -696,10 +960,12 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("SSH MCP Server running on stdio");
+  log.info(`Server started — host=${HOST}, port=${PORT}, user=${USER}, keepalive=15s/3, timeout=${DEFAULT_TIMEOUT}ms`);
 
   // Handle graceful shutdown
   const cleanup = () => {
     console.error("Shutting down SSH MCP Server...");
+    log.info('Server shutting down');
     if (connectionManager) {
       connectionManager.close();
       connectionManager = null;
